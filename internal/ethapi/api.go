@@ -47,6 +47,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // estimateGasErrorRatio is the amount of overestimation eth_estimateGas is
@@ -778,6 +779,115 @@ func (api *BlockChainAPI) Call(ctx context.Context, args TransactionArgs, blockN
 		return nil, newRevertError(result.Revert())
 	}
 	return result.Return(), result.Err
+}
+
+// 定义缓存值的组合结构
+type cacheValue struct {
+	state  *state.StateDB
+	header *types.Header
+}
+
+// 初始化LRU缓存
+const cacheSize = 10
+
+var (
+	// 组合缓存（Key: 区块哈希, Value: 包含StateDB和Header的结构体）
+	blockCache, _ = lru.New[common.Hash, *cacheValue](cacheSize)
+)
+
+// UnsignedCall 执行无签名交易调用
+func (api *BlockChainAPI) unsign_callbundle(ctx context.Context, args TransactionArgs, blockNrOrHash *rpc.BlockNumberOrHash, overrides *override.StateOverride, blockOverrides *override.BlockOverrides) (hexutil.Bytes, error) {
+	// 默认使用最新区块
+	if blockNrOrHash == nil {
+		latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+		blockNrOrHash = &latest
+	}
+
+	// 获取区块哈希
+	blockHash, err := api.b.BlockHashFromNumberOrHash(ctx, *blockNrOrHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// 尝试从缓存获取状态和区块头
+	var (
+		stateDB *state.StateDB
+		header  *types.Header
+	)
+
+	if cached, ok := blockCache.Get(blockHash); ok {
+		// 从缓存中获取并深拷贝
+		stateDB = cached.state.Copy()
+		header = cached.header
+		log.Debug("Block cache hit", "block", blockHash)
+	} else {
+		// 缓存未命中，从节点获取
+		stateDB, header, err = api.b.StateAndHeaderByNumberOrHash(ctx, *blockNrOrHash)
+		if stateDB == nil || err != nil {
+			return nil, err
+		}
+		// 存入缓存
+		blockCache.Add(blockHash, &cacheValue{
+			state:  stateDB.Copy(),
+			header: header,
+		})
+		log.Debug("Block cache miss", "block", blockHash)
+	}
+
+	// 跳过签名验证和燃料检查
+	args.SkipCheckSignature = true
+	args.SkipCheckFee = true
+
+	// 执行单次交易调用
+	result, err := unsign_docallbundle(ctx, api.b, args, stateDB, header, overrides, blockOverrides, api.b.RPCEVMTimeout(), api.b.RPCGasCap())
+	if err != nil {
+		return nil, err
+	}
+	if errors.Is(result.Err, vm.ErrExecutionReverted) {
+		return result.Revert(), nil
+	}
+	return result.Return(), nil
+}
+
+// 优化后的doCall函数
+func unsign_docallbundle(ctx context.Context, b Backend, args TransactionArgs, state *state.StateDB, header *types.Header, overrides *override.StateOverride, blockOverrides *override.BlockOverrides, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
+	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil)
+	if blockOverrides != nil {
+		if err := blockOverrides.Apply(&blockCtx); err != nil {
+			return nil, err
+		}
+	}
+
+	// 配置EVM环境
+	rules := b.ChainConfig().Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time)
+	precompiles := vm.ActivePrecompiledContracts(rules)
+	if err := overrides.Apply(state, precompiles); err != nil {
+		return nil, err
+	}
+
+	// 设置带超时的上下文
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	// 设置燃料池
+	gp := new(core.GasPool)
+	if globalGasCap == 0 {
+		gp.AddGas(math.MaxUint64)
+	} else {
+		gp.AddGas(globalGasCap)
+	}
+
+	// 应用消息（跳过非必要检查）
+	return applyMessage(ctx, b, args, state, header, timeout, gp, &blockCtx, &vm.Config{
+		NoBaseFee:        true, // 跳过基础费用检查
+		SkipNonceCheck:   true, // 跳过nonce检查
+		SkipBalanceCheck: true, // 跳过余额检查
+	}, precompiles, true)
 }
 
 // SimulateV1 executes series of transactions on top of a base state.
